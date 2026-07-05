@@ -35,8 +35,17 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 MAX_RUNTIME = int(os.environ.get("MAX_RUNTIME", "250"))
 
 SEEN_FILE = Path("seen.json")
+HEALTH_FILE = Path("health.json")
 BASE = "https://trouverunlogement.lescrous.fr"
 SUMMARY_THRESHOLD = 8  # au-delà, on envoie 1 notif résumé au lieu de spammer
+
+# Une page qui charge normalement mais où le scraper ne trouve plus AUCUNE carte
+# de logement est un signal différent d'une erreur réseau ou d'une page bloquée :
+# ça sent le changement de structure HTML (ex: renommage des classes CSS par le
+# CROUS). Comme une session ne dure que ~55 min, ce compteur doit survivre entre
+# les sessions -> stocké dans health.json, pas juste en mémoire.
+ZERO_LISTINGS_ALERT_SECONDS = 2 * 3600     # 2h de suite à 0 logement "propre" = alerte
+ZERO_LISTINGS_COOLDOWN_SECONDS = 3 * 3600  # ne pas re-spammer plus souvent que ça
 
 HEADERS = {
     "User-Agent": (
@@ -52,6 +61,28 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
+class PageAnomalyError(Exception):
+    """La page reçue ne ressemble pas à une vraie page CROUS.
+
+    Signe possible : blocage IP / page de garde anti-bot (captcha, 403 stylisé
+    en 200...) ou refonte complète du site. Volontairement indépendant des
+    noms de classes CSS (qui eux peuvent changer sans rien casser de grave) :
+    on vérifie juste que la page a une taille et un contenu plausibles.
+    """
+
+
+MIN_PAGE_LENGTH = 20000  # une vraie page CROUS fait largement plus que ça
+
+
+def _sanity_check_page(html: str) -> None:
+    if len(html) < MIN_PAGE_LENGTH:
+        raise PageAnomalyError(
+            f"Page anormalement courte ({len(html)} caractères, attendu > {MIN_PAGE_LENGTH})."
+        )
+    if "crous" not in html.lower():
+        raise PageAnomalyError("Le mot 'crous' est absent de la page reçue.")
+
+
 # ---------- Récupération des logements ----------
 def fetch_listings() -> dict:
     """Retourne {id: {title, link, price, addr, details}} pour la recherche courante."""
@@ -61,6 +92,7 @@ def fetch_listings() -> dict:
     # l'encodage (retombe sur Latin-1) si l'en-tête HTTP est ambigu, ce qui
     # provoque des accents cassés ("Ã©" au lieu de "é"). On force l'encodage.
     r.encoding = "utf-8"
+    _sanity_check_page(r.text)
     soup = BeautifulSoup(r.text, "html.parser")
 
     listings = {}
@@ -146,6 +178,46 @@ def notify_start(count: int) -> None:
     })
 
 
+def notify_problem(kind: str, detail: str) -> None:
+    _ntfy_post({
+        "topic": NTFY_TOPIC,
+        "title": f"⚠️ Problème de surveillance : {kind}",
+        "message": (
+            f"{detail}\n\nLe bot n'arrive plus à lire le site correctement depuis "
+            "un moment (possible blocage ou changement du site). Vérifie "
+            "manuellement le site en attendant, et regarde les logs GitHub Actions."
+        ),
+        "priority": 5,
+        "tags": ["warning"],
+    })
+
+
+def notify_recovered() -> None:
+    _ntfy_post({
+        "topic": NTFY_TOPIC,
+        "title": "✅ Surveillance rétablie",
+        "message": "Le bot arrive de nouveau à lire le site normalement.",
+        "priority": 3,
+        "tags": ["white_check_mark"],
+    })
+
+
+def notify_zero_listings_stale(hours: float) -> None:
+    _ntfy_post({
+        "topic": NTFY_TOPIC,
+        "title": "⚠️ 0 logement depuis longtemps",
+        "message": (
+            f"Le site répond normalement, mais le bot ne trouve plus AUCUN logement "
+            f"depuis {hours:.1f}h. C'est suspect pour une grande zone comme Paris.\n\n"
+            "Cause probable : le CROUS a changé la structure de sa page (le scraper "
+            "doit être mis à jour) — ou, plus rarement, un vrai passage à 0 logement. "
+            "Vérifie manuellement le site pour comparer."
+        ),
+        "priority": 5,
+        "tags": ["warning"],
+    })
+
+
 # ---------- État persistant ----------
 def load_seen():
     if SEEN_FILE.exists():
@@ -162,18 +234,37 @@ def save_seen(keys) -> None:
     )
 
 
-def commit_state() -> None:
-    """Sauvegarde seen.json ET le committe/pousse tout de suite (best effort).
+def load_health() -> dict:
+    """État persistant du 'streak de 0 logement', survit entre les sessions."""
+    if HEALTH_FILE.exists():
+        try:
+            return json.loads(HEALTH_FILE.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+    return {"zero_since": None, "last_warned": None}
 
-    Important quand une exécution dure ~6h : si le job plante ou est tué en
-    cours de route, on ne veut pas perdre des heures de mémoire (ce qui
-    provoquerait un flot de fausses notifs 'nouveau logement' au redémarrage).
-    Le script git config est fait en amont par le workflow GitHub Actions.
+
+def save_health(health: dict) -> None:
+    HEALTH_FILE.write_text(json.dumps(health, ensure_ascii=False), encoding="utf-8")
+
+
+def commit_state() -> None:
+    """Sauvegarde seen.json + health.json ET les committe/pousse tout de suite
+    (best effort).
+
+    Important quand une session dure jusqu'à ~55 min : si le job plante ou est
+    tué en cours de route, on ne veut pas perdre la mémoire (ce qui provoquerait
+    un flot de fausses notifs 'nouveau logement' au redémarrage, ou repartirait
+    à zéro sur le suivi des anomalies). Le git config est fait en amont par le
+    workflow GitHub Actions.
     """
     import subprocess
 
     try:
-        subprocess.run(["git", "add", "seen.json"], check=True, capture_output=True)
+        paths = [str(SEEN_FILE)]
+        if HEALTH_FILE.exists():
+            paths.append(str(HEALTH_FILE))
+        subprocess.run(["git", "add", *paths], check=True, capture_output=True)
         diff = subprocess.run(
             ["git", "diff", "--staged", "--quiet"], capture_output=True
         )
@@ -190,6 +281,14 @@ def commit_state() -> None:
 
 
 # ---------- Boucle principale ----------
+# Seuils avant alerte (en nombre d'itérations consécutives ratées).
+# Une anomalie de page (probable blocage / refonte du site) est un signal plus
+# fort qu'une simple erreur réseau ponctuelle (timeout, hoquet de connexion) :
+# on alerte donc plus vite dessus.
+ANOMALY_ALERT_THRESHOLD = 3   # ~1-2 min à 30s d'intervalle
+ERROR_ALERT_THRESHOLD = 6     # ~3 min à 30s d'intervalle
+
+
 def main() -> None:
     if not SEARCH_URL:
         die("CROUS_SEARCH_URL non défini (voir le README).")
@@ -199,21 +298,44 @@ def main() -> None:
     seen = load_seen()
     first_run = seen is None
     seen_set = set(seen or [])
+    health = load_health()
 
     deadline = time.time() + MAX_RUNTIME
     last_listings = None
     iteration = 0
 
+    consecutive_anomalies = 0
+    consecutive_errors = 0
+    alerted_this_run = False  # un seul type d'alerte envoyé par session, pas de spam
+
     while True:
         iteration += 1
         stamp = time.strftime("%H:%M:%S")
+        listings = None
         try:
             listings = fetch_listings()
+        except PageAnomalyError as e:
+            consecutive_anomalies += 1
+            consecutive_errors = 0
+            print(f"[{stamp}] iter {iteration} : ANOMALIE page ({e}) "
+                  f"[{consecutive_anomalies}/{ANOMALY_ALERT_THRESHOLD}]")
         except Exception as e:  # noqa: BLE001
-            print(f"[{stamp}] iter {iteration} : échec de la récupération ({e})")
-            listings = None
+            consecutive_errors += 1
+            consecutive_anomalies = 0
+            print(f"[{stamp}] iter {iteration} : échec de la récupération ({e}) "
+                  f"[{consecutive_errors}/{ERROR_ALERT_THRESHOLD}]")
 
         if listings is not None:
+            # Une récupération réussie : si on avait alerté (et que ce n'est pas le
+            # tout premier démarrage), on prévient que c'est réglé. Sur un premier
+            # démarrage, le message "Surveillance active" suffit, pas besoin d'un
+            # "rétabli" qui n'aurait rien à raconter de sensé avant lui.
+            if alerted_this_run and not first_run:
+                notify_recovered()
+            alerted_this_run = False
+            consecutive_anomalies = 0
+            consecutive_errors = 0
+
             last_listings = listings
             if first_run:
                 # Premier lancement : on mémorise sans spammer les logements déjà là
@@ -223,6 +345,34 @@ def main() -> None:
                 print(f"[{stamp}] iter {iteration} : état initial "
                       f"({len(listings)} logement(s)) mémorisé, pas de notif de listing.")
             else:
+                # Suivi du "streak de 0 logement propre" (page OK mais aucune carte
+                # trouvée) : signal distinct d'un simple 0 nouveau, plus révélateur
+                # d'un changement de structure du site que d'un vrai manque d'offre.
+                now = time.time()
+                if len(listings) == 0:
+                    if health.get("zero_since") is None:
+                        health["zero_since"] = now
+                        save_health(health)
+                        commit_state()
+                    duration = now - health["zero_since"]
+                    last_warned = health.get("last_warned")
+                    if duration >= ZERO_LISTINGS_ALERT_SECONDS and (
+                        last_warned is None
+                        or (now - last_warned) >= ZERO_LISTINGS_COOLDOWN_SECONDS
+                    ):
+                        notify_zero_listings_stale(duration / 3600)
+                        health["last_warned"] = now
+                        save_health(health)
+                        commit_state()
+                elif health.get("zero_since") is not None:
+                    # Ça repart : si on avait alerté, on prévient que c'est réglé.
+                    if health.get("last_warned") is not None:
+                        notify_recovered()
+                    health["zero_since"] = None
+                    health["last_warned"] = None
+                    save_health(health)
+                    commit_state()
+
                 new = [k for k in listings if k not in seen_set]
                 if new:
                     print(f"[{stamp}] iter {iteration} : {len(new)} NOUVEAU(X) !")
@@ -241,6 +391,25 @@ def main() -> None:
                 else:
                     print(f"[{stamp}] iter {iteration} : rien de nouveau "
                           f"({len(listings)} en ligne)")
+        else:
+            # Échec de récupération : on alerte une seule fois par session si le
+            # problème persiste, pour ne pas spammer à chaque itération.
+            if not alerted_this_run:
+                if consecutive_anomalies >= ANOMALY_ALERT_THRESHOLD:
+                    notify_problem(
+                        "page suspecte",
+                        f"{consecutive_anomalies} vérifications de suite ont reçu une "
+                        "page qui ne ressemble pas au site CROUS habituel (taille ou "
+                        "contenu anormal). Possible blocage anti-bot ou refonte du site.",
+                    )
+                    alerted_this_run = True
+                elif consecutive_errors >= ERROR_ALERT_THRESHOLD:
+                    notify_problem(
+                        "erreurs réseau répétées",
+                        f"{consecutive_errors} tentatives de suite ont échoué "
+                        "(timeout, erreur HTTP...). Possible blocage IP ou site en panne.",
+                    )
+                    alerted_this_run = True
 
         # Fin de la fenêtre de temps ?
         if time.time() + POLL_INTERVAL >= deadline:
