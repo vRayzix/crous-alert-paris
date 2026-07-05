@@ -2,12 +2,13 @@ name: Check CROUS Paris
 
 on:
   schedule:
-    # Relance TOUTES LES HEURES, pile. Chaque session dure ~55 min (voir
-    # MAX_RUNTIME plus bas), calée sur cet intervalle : pas de trou de plusieurs
-    # dizaines de minutes entre 2 sessions, juste le temps de démarrage de la
-    # machine (quelques secondes).
-    - cron: "0 * * * *"
-  workflow_dispatch: {}   # permet aussi de lancer à la main depuis l'onglet Actions
+    # Ce n'est plus le déclencheur principal : c'est un simple filet de secours
+    # au cas où le service externe (cron-job.org, voir README) serait en panne.
+    # Le vrai déclenchement horaire précis passe par workflow_dispatch, appelé
+    # par cron-job.org via l'API GitHub, PAS par ce schedule interne (qui reste
+    # sujet aux best-effort/délais documentés par GitHub).
+    - cron: "0 3 * * *"   # une fois par jour à 3h UTC, juste au cas où
+  workflow_dispatch: {}   # déclenché par cron-job.org (ou manuellement) toutes les heures
 
 # Nécessaire pour que le job puisse committer seen.json (l'état des logements vus)
 permissions:
@@ -22,7 +23,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 58   # marge de sécurité avant la prochaine heure
+    timeout-minutes: 55   # marge de sécurité, y compris contre un démarrage retardé
     steps:
       - name: Récupérer le code
         uses: actions/checkout@v4
@@ -43,22 +44,37 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Lancer la surveillance (~55 min, calées sur l'heure)
+      - name: Lancer la surveillance (~50 min)
         env:
           CROUS_SEARCH_URL: ${{ secrets.CROUS_SEARCH_URL }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           POLL_INTERVAL: "30"      # vérifie toutes les 30 secondes
-          MAX_RUNTIME: "3300"      # 55 min de vérifications non-stop
+          MAX_RUNTIME: "3000"      # 50 min de vérifications non-stop
         run: python check_crous.py
 
       - name: Sauvegarder l'état final (filet de sécurité)
         # Au cas où le script se termine sans avoir eu de nouveau logement à
-        # committer entre-temps (ex: rien n'a jamais bougé pendant les 55 min).
+        # committer entre-temps (ex: rien n'a jamais bougé pendant les 50 min).
+        #
+        # Le push peut être refusé ("rejected... fetch first") si un AUTRE run
+        # a poussé entre-temps (chevauchement possible aux frontières d'une
+        # session, notamment si un run précédent a été tué par timeout pile au
+        # moment où le suivant démarrait). On gère ça avec un pull --rebase +
+        # nouvelle tentative, plutôt que de faire échouer tout le job pour un
+        # simple conflit d'écriture sans gravité sur ce fichier d'état.
         run: |
-          git add seen.json
+          git add seen.json health.json 2>/dev/null || git add seen.json
           if git diff --staged --quiet; then
             echo "Pas de changement d'état."
-          else
-            git commit -m "update state [skip ci]"
-            git push
+            exit 0
           fi
+          git commit -m "update state [skip ci]"
+          for i in 1 2 3; do
+            if git push; then
+              echo "Poussé avec succès."
+              exit 0
+            fi
+            echo "Push refusé (tentative $i/3), on récupère les changements distants..."
+            git pull --rebase --autostash origin main || true
+          done
+          echo "::warning::Échec du push de l'état final après 3 tentatives (pas grave : les logements seront re-détectés au pire, pas de perte de notif)."

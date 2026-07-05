@@ -252,11 +252,16 @@ def commit_state() -> None:
     """Sauvegarde seen.json + health.json ET les committe/pousse tout de suite
     (best effort).
 
-    Important quand une session dure jusqu'à ~55 min : si le job plante ou est
+    Important quand une session dure jusqu'à ~50 min : si le job plante ou est
     tué en cours de route, on ne veut pas perdre la mémoire (ce qui provoquerait
     un flot de fausses notifs 'nouveau logement' au redémarrage, ou repartirait
     à zéro sur le suivi des anomalies). Le git config est fait en amont par le
     workflow GitHub Actions.
+
+    Le push peut être refusé (non-fast-forward) si un AUTRE run a poussé entre-
+    temps (chevauchement possible aux frontières d'une session). On gère ça
+    avec un pull --rebase + nouvelle tentative, sans faire planter le script
+    pour un simple conflit d'écriture sans gravité sur ce fichier d'état.
     """
     import subprocess
 
@@ -274,8 +279,18 @@ def commit_state() -> None:
             ["git", "commit", "-m", "update state [skip ci]"],
             check=True, capture_output=True,
         )
-        subprocess.run(["git", "push"], check=True, capture_output=True)
-        print("  état committé/poussé.")
+        for attempt in range(1, 4):
+            push = subprocess.run(["git", "push"], capture_output=True)
+            if push.returncode == 0:
+                print("  état committé/poussé.")
+                return
+            print(f"  push refusé (tentative {attempt}/3), pull --rebase...")
+            subprocess.run(
+                ["git", "pull", "--rebase", "--autostash", "origin", "main"],
+                capture_output=True,
+            )
+        print("  (avertissement) échec du push après 3 tentatives, on continue "
+              "(pas grave : au pire, un logement sera re-détecté plus tard).")
     except Exception as e:  # noqa: BLE001
         print(f"  (avertissement) échec du commit intermédiaire : {e}")
 
