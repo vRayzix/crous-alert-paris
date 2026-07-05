@@ -19,21 +19,28 @@ le lien direct pour foncer dessus.
 ## Comment ça marche
 
 ```
-GitHub Actions (toutes les heures)
+GitHub Actions (pile toutes les heures)
         │
         ▼
-check_crous.py tourne en boucle ~5h45
+check_crous.py tourne pendant ~55 minutes
    1. récupère la page de recherche CROUS (bounds = zone géographique choisie)
    2. compare avec les logements déjà vus (seen.json)
    3. si nouveau logement → notif push via ntfy.sh (avec lien direct cliquable)
    4. sauvegarde l'état immédiatement (résistant aux coupures)
+│
+▼
+La session se termine juste avant la prochaine heure → l'heure suivante
+en relance une nouvelle → couverture quasi 24h/24
 ```
 
 - Le script vérifie toutes les **30 secondes**, en continu, pendant des sessions de
-  ~5h45 (limite technique de GitHub Actions : 6h max par exécution). Un déclenchement
-  automatique toutes les heures sert uniquement de filet de sécurité en cas de crash.
+  **~55 minutes**, calées pile sur le déclenchement horaire suivant. Résultat :
+  une surveillance quasi ininterrompue, avec seulement quelques secondes de battement
+  entre deux sessions (le temps que GitHub démarre la machine suivante).
 - Aucune base de données externe : l'état (« quels logements j'ai déjà vus ») est
-  stocké dans un simple fichier JSON, committé automatiquement sur le dépôt.
+  stocké dans un simple fichier JSON, committé automatiquement sur le dépôt — y
+  compris **en cours de route**, pas seulement en fin de session, pour ne rien
+  perdre en cas de coupure.
 - Les notifications passent par **ntfy**, un service de push notifications open-source
   fonctionnant sur un modèle **pub/sub** (comme MQTT) : le script *publie* sur un
   "topic", et ton téléphone y est *abonné*.
