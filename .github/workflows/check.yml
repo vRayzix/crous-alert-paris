@@ -1,0 +1,67 @@
+name: Check CROUS Paris
+
+on:
+  schedule:
+    # Filet de sécurité seulement : relance toutes les heures SI aucune
+    # exécution n'est déjà en cours (voir "concurrency" ci-dessous). La vraie
+    # boucle de vérification tourne en continu à l'intérieur d'un seul job
+    # (voir MAX_RUNTIME plus bas), pas via ce cron.
+    - cron: "0 * * * *"
+  workflow_dispatch: {}   # permet aussi de lancer à la main depuis l'onglet Actions
+
+# Nécessaire pour que le job puisse committer seen.json (l'état des logements vus)
+permissions:
+  contents: write
+
+# Empêche 2 exécutions de tourner en même temps : si un job de 5h50 tourne déjà,
+# le déclenchement horaire suivant patiente simplement en file d'attente au lieu
+# d'en lancer un 2ème en parallèle.
+concurrency:
+  group: crous-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Limite dure de GitHub Actions : 360 min (6h) par job. On vise 350 min
+    # pour laisser une marge de sécurité avant que GitHub ne tue le job.
+    timeout-minutes: 350
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Configurer git
+        # Nécessaire AVANT de lancer le script : celui-ci committe/pousse
+        # seen.json en cours de route (pas seulement à la fin), pour ne pas
+        # perdre l'état si le job de ~6h plante ou est tué en cours de route.
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Lancer la surveillance (boucle quasi continue ~5h45)
+        env:
+          CROUS_SEARCH_URL: ${{ secrets.CROUS_SEARCH_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          POLL_INTERVAL: "30"      # vérifie toutes les 30 secondes
+          MAX_RUNTIME: "20700"     # ~5h45 de vérifications non-stop
+        run: python check_crous.py
+
+      - name: Sauvegarder l'état final (filet de sécurité)
+        # Au cas où le script se termine sans avoir eu de nouveau logement à
+        # committer entre-temps (ex: rien n'a jamais bougé pendant les 5h45).
+        run: |
+          git add seen.json
+          if git diff --staged --quiet; then
+            echo "Pas de changement d'état."
+          else
+            git commit -m "update state [skip ci]"
+            git push
+          fi
