@@ -2,10 +2,10 @@ name: Check CROUS Paris
 
 on:
   schedule:
-    # Filet de sécurité seulement : relance toutes les heures SI aucune
-    # exécution n'est déjà en cours (voir "concurrency" ci-dessous). La vraie
-    # boucle de vérification tourne en continu à l'intérieur d'un seul job
-    # (voir MAX_RUNTIME plus bas), pas via ce cron.
+    # Relance TOUTES LES HEURES, pile. Chaque session dure ~55 min (voir
+    # MAX_RUNTIME plus bas), calée sur cet intervalle : pas de trou de plusieurs
+    # dizaines de minutes entre 2 sessions, juste le temps de démarrage de la
+    # machine (quelques secondes).
     - cron: "0 * * * *"
   workflow_dispatch: {}   # permet aussi de lancer à la main depuis l'onglet Actions
 
@@ -13,9 +13,8 @@ on:
 permissions:
   contents: write
 
-# Empêche 2 exécutions de tourner en même temps : si un job de 5h50 tourne déjà,
-# le déclenchement horaire suivant patiente simplement en file d'attente au lieu
-# d'en lancer un 2ème en parallèle.
+# Sécurité anti-chevauchement : si jamais une session dépasse son créneau (retard
+# GitHub, etc.), on ne lance pas 2 exécutions en parallèle sur la même zone.
 concurrency:
   group: crous-check
   cancel-in-progress: false
@@ -23,9 +22,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # Limite dure de GitHub Actions : 360 min (6h) par job. On vise 350 min
-    # pour laisser une marge de sécurité avant que GitHub ne tue le job.
-    timeout-minutes: 350
+    timeout-minutes: 58   # marge de sécurité avant la prochaine heure
     steps:
       - name: Récupérer le code
         uses: actions/checkout@v4
@@ -41,22 +38,22 @@ jobs:
       - name: Configurer git
         # Nécessaire AVANT de lancer le script : celui-ci committe/pousse
         # seen.json en cours de route (pas seulement à la fin), pour ne pas
-        # perdre l'état si le job de ~6h plante ou est tué en cours de route.
+        # perdre l'état si le job plante ou est tué en cours de route.
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Lancer la surveillance (boucle quasi continue ~5h45)
+      - name: Lancer la surveillance (~55 min, calées sur l'heure)
         env:
           CROUS_SEARCH_URL: ${{ secrets.CROUS_SEARCH_URL }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           POLL_INTERVAL: "30"      # vérifie toutes les 30 secondes
-          MAX_RUNTIME: "20700"     # ~5h45 de vérifications non-stop
+          MAX_RUNTIME: "3300"      # 55 min de vérifications non-stop
         run: python check_crous.py
 
       - name: Sauvegarder l'état final (filet de sécurité)
         # Au cas où le script se termine sans avoir eu de nouveau logement à
-        # committer entre-temps (ex: rien n'a jamais bougé pendant les 5h45).
+        # committer entre-temps (ex: rien n'a jamais bougé pendant les 55 min).
         run: |
           git add seen.json
           if git diff --staged --quiet; then
