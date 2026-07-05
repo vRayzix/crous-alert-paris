@@ -57,6 +57,10 @@ def fetch_listings() -> dict:
     """Retourne {id: {title, link, price, addr, details}} pour la recherche courante."""
     r = requests.get(SEARCH_URL, headers=HEADERS, timeout=30)
     r.raise_for_status()
+    # Le site CROUS sert du contenu en UTF-8, mais `requests` devine parfois mal
+    # l'encodage (retombe sur Latin-1) si l'en-tête HTTP est ambigu, ce qui
+    # provoque des accents cassés ("Ã©" au lieu de "é"). On force l'encodage.
+    r.encoding = "utf-8"
     soup = BeautifulSoup(r.text, "html.parser")
 
     listings = {}
