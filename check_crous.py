@@ -341,6 +341,8 @@ def main() -> None:
 
     consecutive_anomalies = 0
     consecutive_errors = 0
+    last_anomaly_reason = ""
+    last_error_reason = ""
     # Persisté dans health.json (pas juste en mémoire) : sinon, si l'alerte part
     # vers la fin d'une session et que le site se rétablit dans la session
     # SUIVANTE (nouveau process, donc mémoire vidée), on "oublie" qu'il fallait
@@ -356,11 +358,13 @@ def main() -> None:
         except PageAnomalyError as e:
             consecutive_anomalies += 1
             consecutive_errors = 0
+            last_anomaly_reason = str(e)
             print(f"[{stamp}] iter {iteration} : ANOMALIE page ({e}) "
                   f"[{consecutive_anomalies}/{ANOMALY_ALERT_THRESHOLD}]")
         except Exception as e:  # noqa: BLE001
             consecutive_errors += 1
             consecutive_anomalies = 0
+            last_error_reason = str(e)
             print(f"[{stamp}] iter {iteration} : échec de la récupération ({e}) "
                   f"[{consecutive_errors}/{ERROR_ALERT_THRESHOLD}]")
 
@@ -440,9 +444,8 @@ def main() -> None:
                 if consecutive_anomalies >= ANOMALY_ALERT_THRESHOLD:
                     notify_problem(
                         "page suspecte",
-                        f"{consecutive_anomalies} vérifications de suite ont reçu une "
-                        "page qui ne ressemble pas au site CROUS habituel (taille ou "
-                        "contenu anormal). Possible blocage anti-bot ou refonte du site.",
+                        f"{consecutive_anomalies} vérifications de suite ont détecté "
+                        f"une page anormale.\n\nRaison précise : {last_anomaly_reason}",
                     )
                     alerted_this_run = True
                     health["network_alerted"] = True
@@ -451,8 +454,8 @@ def main() -> None:
                 elif consecutive_errors >= ERROR_ALERT_THRESHOLD:
                     notify_problem(
                         "erreurs réseau répétées",
-                        f"{consecutive_errors} tentatives de suite ont échoué "
-                        "(timeout, erreur HTTP...). Possible blocage IP ou site en panne.",
+                        f"{consecutive_errors} tentatives de suite ont échoué.\n\n"
+                        f"Raison précise : {last_error_reason}",
                     )
                     alerted_this_run = True
                     health["network_alerted"] = True
