@@ -65,22 +65,42 @@ class PageAnomalyError(Exception):
     """La page reçue ne ressemble pas à une vraie page CROUS.
 
     Signe possible : blocage IP / page de garde anti-bot (captcha, 403 stylisé
-    en 200...) ou refonte complète du site. Volontairement indépendant des
-    noms de classes CSS (qui eux peuvent changer sans rien casser de grave) :
-    on vérifie juste que la page a une taille et un contenu plausibles.
+    en 200...), page de surcharge ("vous êtes trop nombreux"), ou refonte
+    complète du site.
     """
 
 
-MIN_PAGE_LENGTH = 20000  # une vraie page CROUS fait largement plus que ça
+# Marqueurs de contenu qui prouvent qu'on a bien une vraie page de recherche
+# CROUS, QUE des logements soient trouvés ou non. Volontairement PAS basé sur
+# la taille de la page : une page légitime "Aucun logement trouvé" est bien
+# plus courte qu'une page pleine de résultats, et un seuil de taille fixe la
+# confondrait à tort avec une vraie page de blocage/surcharge (qui, elle,
+# contient même parfois le mot "crous" dans son logo/en-tête, donc un simple
+# test de présence du mot ne suffit pas non plus).
+GENUINE_PAGE_MARKERS = (
+    "mon logement pour l'année",  # titre de la page de résultats, tous cas
+    "aucun logement trouvé",       # cas 0 résultat, légitime
+    "fr-card",                     # cas avec résultats : les cartes logement
+)
+
+# Marqueur explicite de la page de surcharge officielle du CROUS, pour donner
+# un message d'erreur clair plutôt qu'un simple "anomalie" générique quand on
+# la reconnaît précisément.
+OVERLOAD_PAGE_MARKER = "vous êtes trop nombreux"
 
 
 def _sanity_check_page(html: str) -> None:
-    if len(html) < MIN_PAGE_LENGTH:
+    lower = html.lower()
+    if OVERLOAD_PAGE_MARKER in lower:
         raise PageAnomalyError(
-            f"Page anormalement courte ({len(html)} caractères, attendu > {MIN_PAGE_LENGTH})."
+            "Page de surcharge officielle du CROUS (\"vous êtes trop nombreux\")."
         )
-    if "crous" not in html.lower():
-        raise PageAnomalyError("Le mot 'crous' est absent de la page reçue.")
+    if not any(marker in lower for marker in GENUINE_PAGE_MARKERS):
+        raise PageAnomalyError(
+            "Aucun marqueur de page CROUS authentique trouvé (ni résultats, "
+            "ni message '0 logement' officiel) : page probablement bloquée, "
+            "vide, ou site remanié."
+        )
 
 
 # ---------- Récupération des logements ----------
@@ -321,7 +341,11 @@ def main() -> None:
 
     consecutive_anomalies = 0
     consecutive_errors = 0
-    alerted_this_run = False  # un seul type d'alerte envoyé par session, pas de spam
+    # Persisté dans health.json (pas juste en mémoire) : sinon, si l'alerte part
+    # vers la fin d'une session et que le site se rétablit dans la session
+    # SUIVANTE (nouveau process, donc mémoire vidée), on "oublie" qu'il fallait
+    # prévenir du rétablissement, et la notif "✅ rétabli" ne part jamais.
+    alerted_this_run = bool(health.get("network_alerted"))
 
     while True:
         iteration += 1
@@ -348,6 +372,9 @@ def main() -> None:
             if alerted_this_run and not first_run:
                 notify_recovered()
             alerted_this_run = False
+            health["network_alerted"] = False
+            save_health(health)
+            commit_state()
             consecutive_anomalies = 0
             consecutive_errors = 0
 
@@ -418,6 +445,9 @@ def main() -> None:
                         "contenu anormal). Possible blocage anti-bot ou refonte du site.",
                     )
                     alerted_this_run = True
+                    health["network_alerted"] = True
+                    save_health(health)
+                    commit_state()
                 elif consecutive_errors >= ERROR_ALERT_THRESHOLD:
                     notify_problem(
                         "erreurs réseau répétées",
@@ -425,6 +455,9 @@ def main() -> None:
                         "(timeout, erreur HTTP...). Possible blocage IP ou site en panne.",
                     )
                     alerted_this_run = True
+                    health["network_alerted"] = True
+                    save_health(health)
+                    commit_state()
 
         # Fin de la fenêtre de temps ?
         if time.time() + POLL_INTERVAL >= deadline:
